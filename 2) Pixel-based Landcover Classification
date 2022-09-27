@@ -1,0 +1,575 @@
+//Pixel-based Landcover Classification
+//Student No.: 10966533
+//University of Manchester 
+
+/*
+Steps:
+1: Data Preparation
+2: Spectral Indices & yearwise calculation
+3: Time-Series
+4: Time-series charts
+5: Random Forest Classification
+6: Data Visualisation
+*/
+
+//========================================================================================
+//1: Data Preparation
+
+//Merge the sites of training and validation together
+var featuremerge  = Buffer.merge(aoi);
+
+//A: Load in the planet imagery
+var planet = ee.ImageCollection("projects/planet-nicfi/assets/basemaps/americas") //select the collection
+        .filterDate("2016-07-01","2021-04-30") //Filter by the dates 2016 to May 2021
+        .map(function(image){return image.clip(featuremerge)}); //Clip to the area of interest (aoi)
+print(planet,"Planet NICFI Imagery (2016-01-01","2021-05-31)");
+
+//B: Load in the yearly Hansen Global Forest Change datasets
+var GFC = ee.Image('UMD/hansen/global_forest_change_2021_v1_9'); //2021 collection
+print(GFC,"Global Forest Change (2021)");
+var GFC_ILs = GFC.clip(aoi); //Clip to ILs
+
+//C: ESAWorldcover - a Landcover map for quick comparison
+var ESAWorldcover = ee.ImageCollection("ESA/WorldCover/v100")
+        .map(function(image){return image.clip(aoi)}); //Clip to the area of interest (aoi)
+print(ESAWorldcover,"ESAWorldcover (2020)")
+var ESAWorldcover =  ESAWorldcover.first(); //Select the latest image
+
+//D: MapBiomas - landcover maps
+var MapBiomas_ILs = MapBiomas_2020.clip(aoi);
+var MapBiomas_Desired = MapBiomas_ILs.updateMask(MapBiomas_ILs.eq(3) //Forest
+                        .or(MapBiomas_ILs.eq(4) //Savanna
+                        .or(MapBiomas_ILs.eq(12) //Grassland
+                        .or(MapBiomas_ILs.eq(15) //Pasture
+                        .or(MapBiomas_ILs.eq(27) //Sites of no vegetation
+                        .or(MapBiomas_ILs.eq(30) //mining land use
+                        .or(MapBiomas_ILs.eq(33)))))))); //Waterbodies
+
+print("The original MapBiomas Landcover dataset, where training data was sourced from:", MapBiomas_ILs)
+
+//Select overall and yearly forest landcover loss from the GFC dataset
+var allloss = GFC_ILs.select(['lossyear']);
+var lossYear2015 = allloss.select(['lossyear']).eq(15);
+var lossYear2016 = allloss.select(['lossyear']).eq(16);
+var lossYear2017 = allloss.select(['lossyear']).eq(17);
+var lossYear2018 = allloss.select(['lossyear']).eq(18);
+var lossYear2019 = allloss.select(['lossyear']).eq(19);
+var lossYear2020 = allloss.select(['lossyear']).eq(20);
+var lossYear2021 = allloss.select(['lossyear']).eq(21);
+
+//Update masks per dataest to ensure only loss for that year will be selected
+var lossYear2015 = lossYear2015.updateMask(lossYear2015.select('lossyear').eq(1))
+var lossYear2016 = lossYear2016.updateMask(lossYear2016.select('lossyear').eq(1))
+var lossYear2017 = lossYear2017.updateMask(lossYear2017.select('lossyear').eq(1))
+var lossYear2018 = lossYear2018.updateMask(lossYear2018.select('lossyear').eq(1))
+var lossYear2019 = lossYear2019.updateMask(lossYear2019.select('lossyear').eq(1))
+var lossYear2020 = lossYear2020.updateMask(lossYear2020.select('lossyear').eq(1))
+var lossYear2021 = lossYear2021.updateMask(lossYear2021.select('lossyear').eq(1))
+
+//======================================================================================
+//2: Spectral Indices & yearwise calculation
+
+//A: Calculate the NDVI spectral index
+var addNDVI = function(image) {var ndvi = image.normalizedDifference(['N', 'R'])
+  .rename('NDVI')
+  .copyProperties(image,['system:time_start']);
+  return image.addBands(ndvi);
+};
+
+//Max NDVI
+var addMaxNDVI = function(image) {var ndvi = image.normalizedDifference(['N', 'R'])
+  .reduce(ee.Reducer.max()) //Maximum
+  .rename('MAX_NDVI')
+  .copyProperties(image,['system:time_start']);
+  return image.addBands(ndvi);
+};
+
+//Max NDVI
+var addMinNDVI = function(image) {var ndvi = image.normalizedDifference(['N', 'R'])
+  .reduce(ee.Reducer.min()) //Maximum
+  .rename('MIN_NDVI')
+  .copyProperties(image,['system:time_start']);
+  return image.addBands(ndvi);
+};
+
+//Sum NDVI
+var addSumNDVI = function(image) {var ndvi = image.normalizedDifference(['N', 'R'])
+  .reduce(ee.Reducer.sum()) //Maximum
+  .rename('SUM_NDVI')
+  .copyProperties(image,['system:time_start']);
+  return image.addBands(ndvi);
+};
+
+//B: Calculate the EVI 
+var addEVI = function (image) {
+      var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', 
+      {'NIR': image.select("N"),
+      'RED': image.select("R"),
+      'BLUE': image.select("B")})
+    .rename ('EVI')
+    .copyProperties(image,['system:time_start']);
+    return image.addBands(evi);
+};
+
+//Max EVI 
+var addMaxEVI = function (image) {
+      var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', 
+      {'NIR': image.select("N"),
+      'RED': image.select("R"),
+      'BLUE': image.select("B")})
+            .reduce(ee.Reducer.max()) //Max EVI
+    .rename ('MAX_EVI')
+    .copyProperties(image,['system:time_start']);
+    return image.addBands(evi);
+};
+
+//Sum EVI
+var addSumEVI = function (image) {
+      var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', 
+      {'NIR': image.select("N"),
+      'RED': image.select("R"),
+      'BLUE': image.select("B")})
+            .reduce(ee.Reducer.sum()) //Sum EVI
+    .rename ('SUM_EVI')
+    .copyProperties(image,['system:time_start']);
+    return image.addBands(evi);
+};
+
+//Calculate the tassel-cap indices
+//C: TCA
+var addTCA = function(image){ 
+  var b = ee.Image(image).select(["R","B","G","N"]); // select the image bands
+  var brt_coeffs = ee.Image.constant([0.4158, 0.5524, 0.5741, 0.3124]); // set brt coeffs - make an image object from a list of values - each of list element represents a band
+  var grn_coeffs = ee.Image.constant([-0.2819, -0.4934, 0.7940, -0.0002]); // set grn coeffs - make an image object from a list of values - each of list element represents a band
+  var sum = ee.Reducer.sum(); // create a sum reducer to be applyed in the next steps of summing the TC-coef-weighted bands
+  var brightness = b.multiply(brt_coeffs).reduce(sum); // multiply the image bands by the brt coef and then sum the bands
+  var greenness = b.multiply(grn_coeffs).reduce(sum); // multiply the image bands by the grn coef and then sum the bands
+  var tca = ((greenness.divide(brightness)).atan().multiply(180/Math.PI).multiply(100))
+        .rename('TCA')
+        .copyProperties(image,['system:time_start']);
+  return image.addBands(tca);
+};
+
+//D: TCB
+var addTCB = function(image){ 
+  var b = ee.Image(image).select(["R","B","G","N"]); // select the image bands
+  var brt_coeffs = ee.Image.constant([0.4158, 0.5524, 0.5741, 0.3124]); // set brt coeffs - make an image object from a list of values - each of list element represents a band
+  var sum = ee.Reducer.sum(); // create a sum reducer to be applyed in the next steps of summing the TC-coef-weighted bands
+  var tcb = (b.multiply(brt_coeffs).reduce(sum)) // multiply the image bands by the brt coef and then sum the bands
+     .rename('TCB')
+   .copyProperties(image,['system:time_start']);
+  return image.addBands(tcb);
+};
+
+//E:TCG
+var addTCG = function(image){ 
+  var b = ee.Image(image).select(["R","B","G","N"]); // select the image bands
+  var grn_coeffs = ee.Image.constant([-0.2819, -0.4934, 0.7940, -0.0002]); // set grn coeffs - make an image object from a list of values - each of list element represents a band
+  var sum = ee.Reducer.sum(); // create a sum reducer to be applyed in the next steps of summing the TC-coef-weighted bands
+  var tcg = (b.multiply(grn_coeffs).reduce(sum)) // multiply the image bands by the grn coef and then sum the bands
+      .rename('TCG')
+      .copyProperties(image,['system:time_start']);
+  return  image.addBands(tcg);
+};
+
+//F: TCW
+var addTCW = function(image){ 
+  var b = ee.Image(image).select(["R","B","G","N"]); // select the image bands
+  var wet_coeffs = ee.Image.constant([0.2021, 0.3102, 0.1594, -0.6806]); // set wet coeffs - make an image object from a list of values - each of list element represents a band
+  var sum = ee.Reducer.sum(); // create a sum reducer to be applyed in the next steps of summing the TC-coef-weighted bands
+  var tcw = (b.multiply(wet_coeffs).reduce(sum)) // multiply the image bands by the wet coef and then sum the bands
+       .rename('TCW')
+       .copyProperties(image,['system:time_start']);
+  return  image.addBands(tcw);
+};
+
+//Create a yearwise GLCM dataset
+//GLCM
+var addGLCM = function(image){ 
+  var glcm = image.glcmTexture(1)
+       .copyProperties(image,['system:time_start']);
+  return  image.addBands(glcm);
+};
+
+//---------------------------------------------------------------------
+//Map all the spectral indices onto each NICFI mosaic
+var inBands = ["R","G","B","N"] //Select the base bands
+var GLCMcollection = planet.select(inBands).map(addGLCM);
+var GLCMandInBands = ["R","G","B","N",  
+                    "N_asm","N_contrast","N_corr","N_idm" ,"N_savg","N_svar" ,
+                    "N_diss" ,"N_ent","N_sent","N_dvar","N_dent",
+                    "N_imcorr1","N_imcorr2","N_maxcorr","N_inertia","N_shade","N_prom"
+                    ];
+//Map the GLCM and then all the spectral indices onto each NICFI mosaic
+var selectedGLCM = GLCMcollection.select(GLCMandInBands)
+
+var collection = selectedGLCM
+                          .map(addNDVI).map(addMaxNDVI).map(addSumNDVI)
+                          .map(addEVI).map(addMaxEVI).map(addSumEVI)
+                          .map(addTCA).map(addTCB).map(addTCG).map(addTCW);
+print(collection,'NICFI collection with Spectral indices');
+
+var inputFeatures = ["R", "B", "G", "N", 
+              "NDVI", "MAX_NDVI","SUM_NDVI", 
+              "EVI", "MAX_EVI", "SUM_EVI",
+              "TCA","TCB","TCG","TCW",
+                          "N_asm","N_contrast","N_corr","N_idm" ,"N_savg","N_svar" ,
+                    "N_diss" ,"N_ent","N_sent","N_dvar","N_dent","N_imcorr1","N_imcorr2","N_maxcorr","N_inertia","N_shade","N_prom"
+              ];
+
+//Calculate yearwises image (average band value per year)
+var year = ee.List.sequence(2016,2021);
+var year_func = function(y){
+      var range = ee.Filter.calendarRange (y, y, 'year');
+      return collection.filter(range).mean().set ('Year', y)
+    };
+var yearwise = ee.ImageCollection(year.map(year_func));
+print (yearwise,"Yearwise NICFI data collection");
+
+//Extract individual image for future visualisation
+var yearwiselist = yearwise.toList(yearwise.size());
+var yearwise2016 = ee.Image(yearwiselist.get(0));
+var yearwise2017 = ee.Image(yearwiselist.get(1));
+var yearwise2018 = ee.Image(yearwiselist.get(2));
+var yearwise2019 = ee.Image(yearwiselist.get(3));
+var yearwise2020 = ee.Image(yearwiselist.get(4));
+var yearwise2021 = ee.Image(yearwiselist.get(5));
+
+var inputImage = (collection.toArray().arrayFlatten([
+  ee.List.sequence(1, collection.size()).map(function (it) { return ee.String(ee.Number(it).int()) }),
+  inputFeatures
+]));
+print(inputImage,"inputImage used to train the multiemporal landcover classification");
+var ImageBandNames = inputImage.bandNames();
+
+
+//======================================================================================
+//4: Charts
+//To visualise how the selected spectral indices changed overtime, according to the sites of ASGM highlighted by MapBiomas (2015-2020)
+
+//A: Spectral signature chart
+//Add the landcover image as a band to the image
+var desiredlandcoverClass = yearwise2021.select([0,1,2,3]).addBands(MapBiomas_Desired);
+print(desiredlandcoverClass,"desiredlandcoverClass")
+
+// Define a list of wavelengths for x-axis labels.
+var wavelengths = [0.45,0.53, 0.64, 0.85,0.88];
+
+// Define the chart and print it to the console.
+var mapbiomas_2020_chart = ui.Chart.image
+                .byClass({
+                  image: desiredlandcoverClass, //Select imagery with added bands
+                  classBand: 'b1', //Select landcover band
+                  region: aoi, //Select only the regions defined by the vectorised landcover featurecollection
+                  reducer: ee.Reducer.mean(), //Calculate the mean 
+                  scale: 500, //At a scale of 500m
+                      //classLabels: ['Forest', 'Savanna', 'Grasslands', 'Pasture', "No Vegetation", 'Waterbodies'],
+                  xLabels: wavelengths
+                })
+                .setChartType('ScatterChart') //Produce a scatter plot
+                .setOptions({
+                  title: 'Spectral Signatures',
+                  hAxis: {
+                    title: 'Wavelength (nm)',
+                    titleTextStyle: {italic: false, bold: true},
+                    viewWindow: {min: wavelengths[0], max: wavelengths[4]} //Select the x-axis wavelength values defined above
+                  },
+                  vAxis: {
+                    title: 'Reflectance (x1e4)',
+                    titleTextStyle: {italic: false, bold: true}
+                  },
+                  colors: [ '006400','00FF00','B8AF4F','FFD966','D5D5E5','000000','0000FF'],
+                  pointSize: 0,
+                  lineSize: 5,
+                  curveType: 'function'
+                });
+print(mapbiomas_2020_chart,"Spectral Signatures of: Forests, Savannas, Grasslands, Pastures, Areas of No Vegetation,  ASGM sites and Waterbodies");
+
+//NDVI
+var yearwise_ndvi_change_in_ASGMSites = ee.ImageCollection(yearwise.select(["NDVI"]))
+                  .map(function(image){return image.clip(ASGM_All)});
+
+var chart = ui.Chart.image.series ({
+  imageCollection: yearwise_ndvi_change_in_ASGMSites,
+  region: aoi,
+  reducer: ee.Reducer.mean(),
+  scale: 500,
+  xProperty: 'system:index'
+}).setOptions ({title: "NDVI over time",
+  hAxis: {title: 'Year'}
+});
+print(chart)
+
+//EVI time-series chart:
+var yearwise_evi_change_in_ASGMSites = ee.ImageCollection(yearwise.select(["EVI"]))
+                  .map(function(image){return image.clip(ASGM_All)});
+
+var evi_chart = ui.Chart.image.series ({
+  imageCollection: yearwise_evi_change_in_ASGMSites,
+  region: aoi,
+  reducer: ee.Reducer.mean(),
+  scale: 500,
+  xProperty: 'Year'
+}).setOptions ({title: "EVI over time",
+  hAxis: {title: 'Year'}
+});
+print(evi_chart)
+
+//TCB time-series chart:
+var yearwise_TCB_change_in_ASGMSites = ee.ImageCollection(yearwise.select(["TCB"]))
+                  .map(function(image){return image.clip(ASGM_All)});
+
+var TCB_chart = ui.Chart.image.series ({
+  imageCollection: yearwise_TCB_change_in_ASGMSites,
+  region: aoi,
+  reducer: ee.Reducer.mean(),
+  scale: 500,
+  xProperty: 'system:index'
+}).setOptions ({title: "TCB over time",
+  hAxis: {title: 'Year'}
+});
+print(TCB_chart)
+
+//TCA time-series chart:
+var yearwise_TCA_change_in_ASGMSites = ee.ImageCollection(yearwise.select(["TCA"]))
+                  .map(function(image){return image.clip(ASGM_All)});
+
+var TCA_chart = ui.Chart.image.series ({
+  imageCollection: yearwise_TCA_change_in_ASGMSites,
+  region: aoi,
+  reducer: ee.Reducer.mean(),
+  scale: 500,
+  xProperty: 'system:index'
+}).setOptions ({title: "TCA over time",
+  hAxis: {title: 'Year'}
+});
+print(TCA_chart)
+
+//TCG time-series chart:
+var yearwise_TCG_change_in_ASGMSites = ee.ImageCollection(yearwise.select(["TCG"]))
+                  .map(function(image){return image.clip(ASGM_All)});
+
+var TCG_chart = ui.Chart.image.series ({
+  imageCollection: yearwise_TCG_change_in_ASGMSites,
+  region: aoi,
+  reducer: ee.Reducer.mean(),
+  scale: 500,
+  xProperty: 'system:index'
+}).setOptions ({title: "TCG over time",
+  hAxis: {title: 'Year'}
+});
+print(TCG_chart)
+
+//TCW time-series chart:
+var yearwise_TCW_change_in_ASGMSites = ee.ImageCollection(yearwise.select(["TCW"]))
+                  .map(function(image){return image.clip(ASGM_All)});
+
+var TCW_chart = ui.Chart.image.series ({
+  imageCollection: yearwise_TCW_change_in_ASGMSites,
+  region: aoi,
+  reducer: ee.Reducer.mean(),
+  scale: 500,
+  xProperty: 'system:index'
+}).setOptions ({title: "TCW over time",
+  hAxis: {title: 'Year'}
+});
+print(TCW_chart)
+
+//==============================================================================
+//5: Random Forest Classification: ASGM vs No ASGM presence
+
+//A: Training
+// Overlay the training points on the selected imagery to get a training sample: 
+//includes the ASGM vs No_ASGM classification property ('CID')
+var training = inputImage
+                   .sampleRegions({
+                     collection: trainingPts,
+                     properties: ['CID'],
+                     scale: 50,
+                     tileScale: 8
+                   });
+
+print(training, "Training") //Inspect your training dataset
+
+//Train a random forest classifier
+var trainedRf = ee.Classifier.smileRandomForest({numberOfTrees: 1000}).train({ //How many trees are selected
+  features: training, //Your training dataset
+  classProperty: 'CID', //Your classification property
+  inputProperties: ImageBandNames //Your bands of interest
+});
+
+var classifiedRf = inputImage
+  .classify(trainedRf); //Generate your classified image
+
+//Generate the training error matrix and accuracy for the RF classifier by using the "confusionMatrix" function to generate metrics on the resubstitution accuracy.
+var trainAccuracyRf = trainedRf.confusionMatrix();
+
+// Print model accuracy results.
+print('##### TRAINING ACCURACY #####');
+print('RF: overall accuracy:', trainAccuracyRf.accuracy());
+print("Train Consumer accuracy", trainAccuracyRf.consumersAccuracy());
+print("Train Producer accuracy", trainAccuracyRf.producersAccuracy());
+print('RF: error matrix:', trainAccuracyRf);
+print("Kappa", trainAccuracyRf.kappa());
+
+//-------------------------------------------------------------------------------------------
+//B: Validation
+
+// Extract band pixel values for validation points.
+var validation = inputImage
+                     .sampleRegions({
+                       collection: validationPts,
+                       properties: ['CID'],
+                       scale: 30,
+                       tileScale: 8
+                     });
+print(validation,"validation")
+
+//Train a random forest classifier
+var validationRf = ee.Classifier.smileRandomForest({numberOfTrees: 2000}).train({ //How many trees are selected
+  features: validation, //Your validation dataset
+  classProperty: 'CID' //Your classification property
+  ,inputProperties: ImageBandNames //Your bands of interest
+});
+
+// Classify the validation data.
+var validatedRf = validation.classify(validationRf);
+print(validatedRf,"validatedRf")
+var validationErrorRf = validatedRf.errorMatrix("CID","classification");
+
+// Print validation accuracy results.
+print('##### VALIDATION ACCURACY #####');
+// Compute accuracy metrics from the error matrix.
+print("Overall accuracy", validationErrorRf.accuracy());
+print("Consumer's accuracy", validationErrorRf.consumersAccuracy());
+print("Producer's accuracy", validationErrorRf.producersAccuracy());
+print('RF: error matrix:', validationErrorRf);
+print("Kappa", validationErrorRf.kappa());
+
+//==========================================================================
+//Data visualisation
+
+//Set visualisation parameters
+var classVis = {min: 1, max: 5, palette: ['006400','FFD966','D5D5E5','0000FF']}; //RF classification layer
+  
+var TrueCol = { 
+    bands: ["R", "G", "B"], //R = Red, G = Green, B = Blue bands
+    min: 64, //The minimum reflectance value
+    max: 5454, //The maximum reflectance value
+    gamma:2, //Gamma correction factor
+    opacity:1 //Ppacity of image (1 = fully opaque)
+  };      
+
+var FalseCol = { 
+    bands: ["N", "R", "G"], // N= NIR, R = Red, G = Green bands
+    min: 64,
+    max: 5454,
+    gamma:1.8,
+    opacity:1
+  };      
+
+var treeLossVisParam = { //For GFC loss visualisation
+  bands: ['lossyear'],
+  min: 0,
+  max: 1,
+  palette: ['black', "red"] //black = 0 (no loss), red = 1 (change to non-forest, gain in loss)
+};
+
+var ESAvisualization = {
+  bands: ['Map'],
+};
+
+var NDVIvisParams = {
+  bands: ["NDVI"],
+  min: -1,
+  max: 1,
+  palette: ['navy', 'blue', 'red', 'orange', 'yellow', 'lime', 'green']
+};
+
+var MapBiomasPalette = {
+  bands: ["b1"],
+  min: 3,
+  max: 33,
+  palette: ['006400','00FF00','B8AF4F','FFD966','D5D5E5','AF2A2A','0000FF']
+};
+
+//==========================================================================
+//Add map layers
+// Display training and validation points to see distribution within the AOI.
+Map.centerObject(trainingPts); //Centre on the training points
+Map.addLayer(trainingPts, {color: 'green'}, 'Training points');
+Map.addLayer(validationPts, {color: 'yellow'}, 'Validation points');
+
+//Classification - ASGM vs No ASGM
+Map.addLayer(classifiedRf.clipToCollection(aoi), classVis, 'Random Forest Classification');
+Map.addLayer(classifiedRf.clipToCollection(Buffer), classVis, 'Random Forest Validation');
+Map.addLayer(MapBiomas_Desired, MapBiomasPalette, 'Original MapBiomas_2020 landcover layer');
+
+//Yearwise NICFI imagery
+Map.addLayer(yearwise2021,TrueCol, "Yearwise true colour NICFI imagery for 2021");
+Map.addLayer(yearwise2021, FalseCol, "Yearwise false colour NICFI imagery for 2021", false);
+//Map.addLayer(yearwise2021, NDVIvisParams, "NDVI 2021");
+
+//GFC loss
+Map.addLayer(lossYear2021, treeLossVisParam, 'Forest loss in 2021, GFC', false);
+Map.addLayer(allloss, treeLossVisParam, 'Total forest loss, GFC (2000-2021)');
+
+//MapBiomas ASGM polygons
+Map.addLayer(ASGM_All,{palette:"000000"}, "ASGM (2015-2020), according to MapBiomas");
+Map.addLayer(ASGM_2020, {palette: "000000"}, 'ASGM in 2020, according to MapBiomas');
+
+//ESA WorldCover Landcover
+Map.addLayer(ESAWorldcover, ESAvisualization, "ESA Worldcover 2020")
+
+//The training and validation points
+print(trainingPts, "Training Points") 
+print(validationPts, "Validation Points")
+
+
+//Export per indigenous land
+//1: Kayapo
+Export.image.toDrive({
+  image: classifiedRf, //The name of your image
+  description: 'Landcover_Kayapo_RF5_5m', 
+  fileNamePrefix: 'Landcover_Kayapo_RF5_5m', 
+  region: IL_Kayapo, 
+  fileFormat: 'GEOTIFF',
+  scale: 5, 
+  maxPixels: 10000000000000
+});
+
+//2: Munduruku & Sai-Cinza
+Export.image.toDrive({
+  image: classifiedRf, //The name of your image
+  description: 'Landcover_Mund_RF5_5m', 
+  fileNamePrefix: 'Landcover_Mund_RF5_5m', 
+  region: IL_Mund, 
+  fileFormat: 'GEOTIFF',
+  scale: 5, 
+  maxPixels: 10000000000000
+});
+
+//4: Sarar
+Export.image.toDrive({
+  image: classifiedRf, //The name of your image
+  description: 'Landcover_Sarar_RF5_5m', 
+  fileNamePrefix: 'Landcover_Sarar_RF5_5m', 
+  region: IL_Sarar, 
+  fileFormat: 'GEOTIFF',
+  scale: 5, 
+  maxPixels: 10000000000000
+});
+
+//5: Yanomami
+Export.image.toDrive({
+  image: classifiedRf, //The name of your image
+  description: 'Landcover_Yanomami_RF5_5m', 
+  fileNamePrefix: 'Landcover_Yanomami_RF4_5m', 
+  region: IL_Yanomami, 
+  fileFormat: 'GEOTIFF',
+  scale: 5, 
+  maxPixels: 10000000000000
+});
